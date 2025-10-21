@@ -1,278 +1,437 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
 import { 
-  getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
+  getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken 
 } from 'firebase/auth';
 import { 
-  getFirestore, doc, collection, query, onSnapshot, setDoc, deleteDoc 
+  getFirestore, doc, collection, query, where, onSnapshot, setDoc, deleteDoc, updateDoc, 
+  serverTimestamp 
 } from 'firebase/firestore';
 
-// --- Global Variables (Canvas Runtime Provided) ---
-// We use these checks to ensure the app runs both in the environment
-// and potentially locally if the user hardcodes values.
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : '';
+// --- Configuration Setup (Using Safe Placeholders for Vercel Build) ---
+// For a live environment, you MUST replace these placeholders with your actual
+// Firebase configuration values gathered in Phase 2.
+const VERCEL_APP_ID = 'YOUR_FIREBASE_PROJECT_ID'; 
+const VERCEL_API_KEY = "AIzaSy...your-api-key..."; 
+const VERCEL_AUTH_DOMAIN = "your-project-id.firebaseapp.com";
+const VERCEL_PROJECT_ID = "your-project-id";
+const VERCEL_STORAGE_BUCKET = "your-project-id.appspot.com";
+const VERCEL_MESSAGING_SENDER_ID = "...";
+const VERCEL_MEASUREMENT_ID = "G-..."; 
 
-// Constants
-const HABIT_LIMIT = 3; // Enforce the free tier limit from the strategy
-const APP_TITLE = "Habit Forge Lite";
 
-// Utility function to get today's date key (YYYY-MM-DD)
-const getTodayKey = () => {
-  return new Date().toISOString().split('T')[0];
+const firebaseConfig = {
+  apiKey: VERCEL_API_KEY,
+  authDomain: VERCEL_AUTH_DOMAIN,
+  projectId: VERCEL_PROJECT_ID,
+  storageBucket: VERCEL_STORAGE_BUCKET,
+  messagingSenderId: VERCEL_MESSAGING_SENDER_ID,
+  appId: VERCEL_APP_ID,
+  measurementId: VERCEL_MEASUREMENT_ID
 };
 
-// Main Application Component
-const App = () => {
-  const [db, setDb] = useState(null);
-  const [auth, setAuth] = useState(null);
-  const [userId, setUserId] = useState(null);
+const initialAuthToken = ''; 
+
+// Initialize Firebase once
+let app;
+let db;
+let auth;
+
+try {
+  app = initializeApp(firebaseConfig);
+  db = getFirestore(app);
+  auth = getAuth(app);
+} catch (e) {
+  // eslint-disable-next-line no-console
+  console.error("Firebase Initialization Error:", e);
+}
+
+
+// Utility function to generate a unique ID if auth.currentUser?.uid is not available
+const getUserId = (user) => {
+  return user?.uid || crypto.randomUUID();
+};
+
+
+const HabitTracker = () => {
   const [habits, setHabits] = useState([]);
   const [newHabitName, setNewHabitName] = useState('');
   const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState('');
+  const [error, setError] = useState(null);
+  const [user, setUser] = useState(null);
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  
+  const MAX_FREE_HABITS = 3;
+  const isHabitLimitReached = habits.length >= MAX_FREE_HABITS;
 
-  // 1. Firebase Initialization and Authentication
+  // --- Auth & Firebase Setup ---
   useEffect(() => {
-    try {
-      if (Object.keys(firebaseConfig).length === 0) {
-        throw new Error("Firebase config is missing.");
-      }
-      
-      const app = initializeApp(firebaseConfig);
-      const firestoreDb = getFirestore(app);
-      const authInstance = getAuth(app);
-      
-      setDb(firestoreDb);
-      setAuth(authInstance);
+    if (!auth) return;
 
-      // Set up authentication state listener
-      const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
-        if (!user) {
-          // Sign in using provided token or anonymously if token is missing
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (currentUser) {
+        setUser(currentUser);
+      } else {
+        // Sign in anonymously if no token is provided or user is logged out
+        try {
           if (initialAuthToken) {
-            await signInWithCustomToken(authInstance, initialAuthToken);
+            await signInWithCustomToken(auth, initialAuthToken);
           } else {
-            await signInAnonymously(authInstance);
+            await signInAnonymously(auth);
           }
+        } catch (authError) {
+          setError(`Authentication failed: ${authError.message}`);
+          setIsLoading(false);
         }
-        // Once signed in (or already signed in), set the userId
-        setUserId(authInstance.currentUser?.uid || crypto.randomUUID());
-        setIsLoading(false);
-        console.log("Firebase Auth Ready. User ID:", authInstance.currentUser?.uid || 'Anonymous');
-      });
+      }
+    });
 
-      return () => unsubscribe(); // Cleanup auth listener
-    } catch (e) {
-      console.error("Firebase Initialization Error:", e);
-      setError("Failed to connect to backend. Check console for details.");
-      setIsLoading(false);
-    }
+    return () => unsubscribe();
   }, []);
 
-  // 2. Firestore Real-Time Data Listener (onSnapshot)
+  // --- Data Fetching (Real-time Listener) ---
   useEffect(() => {
-    if (db && userId) {
-      const habitsPath = `/artifacts/${appId}/users/${userId}/habits`;
-      const habitsQuery = query(collection(db, habitsPath));
-      
-      const unsubscribe = onSnapshot(habitsQuery, (snapshot) => {
-        const habitsData = snapshot.docs.map(doc => ({
+    if (!db || !user) {
+      // Wait for Firebase and user to be initialized
+      setIsLoading(true);
+      return;
+    }
+
+    const userId = getUserId(user);
+    const appId = VERCEL_PROJECT_ID; // Using project ID as a substitute for __app_id
+
+    // Firestore Path: /artifacts/{appId}/users/{userId}/habits
+    const habitsCollectionRef = collection(db, 
+      `artifacts/${appId}/users/${userId}/habits`
+    );
+
+    // Set up real-time listener
+    const q = query(habitsCollectionRef);
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedHabits = snapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
           id: doc.id,
-          ...doc.data()
-        }));
-        setHabits(habitsData);
-        console.log(`Habits loaded: ${habitsData.length}`);
-      }, (e) => {
-        console.error("Firestore Snapshot Error:", e);
-        setError("Error fetching habit data.");
-      });
+          name: data.name,
+          // Deserialize dates and handle potential nulls/missing fields
+          lastCompleted: data.lastCompleted?.toDate() || null,
+          streak: data.streak || 0,
+          createdAt: data.createdAt?.toDate() || new Date(),
+        };
+      }).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()); // Sort by creation date
+      
+      setHabits(fetchedHabits);
+      setIsLoading(false);
+    }, (err) => {
+      // eslint-disable-next-line no-console
+      console.error("Firestore Snapshot Error:", err);
+      setError("Failed to load habits. Please check connection.");
+      setIsLoading(false);
+    });
 
-      return () => unsubscribe(); // Cleanup snapshot listener
-    }
-  }, [db, userId]);
+    return () => unsubscribe();
+  }, [user]); // Re-run effect when user changes
 
-  // --- Habit Management Logic ---
+  // --- Core Habit Logic ---
 
-  const todayKey = useMemo(getTodayKey, []);
-  
-  const addHabit = useCallback(async (name) => {
-    if (!name.trim()) return;
-    if (habits.length >= HABIT_LIMIT) {
-      alert("Upgrade to Pro to track more than 3 habits!"); // Use alert() replacement logic
-      console.warn("Attempted to add more than 3 habits (Free Tier Limit).");
+  const handleAddHabit = async (e) => {
+    e.preventDefault();
+    if (newHabitName.trim() === '') return;
+
+    if (isHabitLimitReached) {
+      setShowUpgradeModal(true);
       return;
     }
-    if (!db || !userId) {
-      setError("System not ready. Please wait or refresh.");
-      return;
-    }
 
-    const newHabitRef = doc(collection(db, `/artifacts/${appId}/users/${userId}/habits`));
-    
+    const newHabit = {
+      name: newHabitName.trim(),
+      createdAt: serverTimestamp(),
+      lastCompleted: null,
+      streak: 0,
+    };
+
     try {
-      await setDoc(newHabitRef, {
-        name: name.trim(),
-        createdAt: new Date(),
-        // Initialize today's status as false
-        [todayKey]: false, 
-      });
+      const userId = getUserId(user);
+      const appId = VERCEL_PROJECT_ID; 
+      const habitsCollectionRef = collection(db, 
+        `artifacts/${appId}/users/${userId}/habits`
+      );
+      
+      await setDoc(doc(habitsCollectionRef), newHabit);
       setNewHabitName('');
     } catch (e) {
-      console.error("Error adding habit:", e);
-      setError("Could not save habit. Try again.");
+      // eslint-disable-next-line no-console
+      console.error("Error adding document: ", e);
+      setError("Failed to add habit.");
     }
-  }, [db, userId, habits, todayKey]);
-
-  const toggleHabit = useCallback(async (habit) => {
-    if (!db || !userId) return;
-    
-    const habitRef = doc(db, `/artifacts/${appId}/users/${userId}/habits`, habit.id);
-    const isCompleted = habit[todayKey] || false;
-    
-    try {
-      // Update only the current day's completion status
-      await setDoc(habitRef, { [todayKey]: !isCompleted }, { merge: true });
-    } catch (e) {
-      console.error("Error toggling habit:", e);
-      setError("Could not update habit status.");
-    }
-  }, [db, userId, todayKey]);
-
-  const deleteHabit = useCallback(async (habitId) => {
-    if (!db || !userId) return;
-    
-    // Custom modal replacement for confirmation (as alert is forbidden)
-    if (!window.confirm("Are you sure you want to delete this habit?")) return;
-    
-    const habitRef = doc(db, `/artifacts/${appId}/users/${userId}/habits`, habitId);
-    
-    try {
-      await deleteDoc(habitRef);
-    } catch (e) {
-      console.error("Error deleting habit:", e);
-      setError("Could not delete habit.");
-    }
-  }, [db, userId]);
-
-  // --- Rendering Functions ---
-
-  const renderHabits = () => {
-    return habits.map((habit) => {
-      const isCompleted = habit[todayKey] || false;
-      
-      return (
-        <div 
-          key={habit.id} 
-          className="flex items-center justify-between p-4 bg-white rounded-xl shadow-md mb-3 transition-all duration-300 hover:shadow-lg hover:bg-indigo-50"
-        >
-          <div className="flex items-center space-x-4">
-            <button 
-              onClick={() => toggleHabit(habit)}
-              className={`w-8 h-8 rounded-full border-2 transition-colors duration-300 flex items-center justify-center 
-                ${isCompleted ? 'bg-indigo-600 border-indigo-600' : 'bg-gray-200 border-gray-300 hover:bg-indigo-200'}
-              `}
-              aria-label={isCompleted ? "Mark incomplete" : "Mark complete"}
-            >
-              <svg className={`w-4 h-4 text-white transition-opacity duration-300 ${isCompleted ? 'opacity-100' : 'opacity-0'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>
-            </button>
-            <span className={`text-lg font-medium ${isCompleted ? 'text-gray-500 line-through' : 'text-gray-800'}`}>
-              {habit.name}
-            </span>
-          </div>
-          
-          <button 
-            onClick={() => deleteHabit(habit.id)}
-            className="text-gray-400 hover:text-red-500 transition-colors duration-200 p-1"
-            aria-label="Delete habit"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-          </button>
-        </div>
-      );
-    });
   };
 
-  // --- Main Render ---
+  const handleToggleHabit = async (habit) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const isCompletedToday = habit.lastCompleted && habit.lastCompleted >= today;
+    
+    // Check if habit was completed yesterday to continue streak
+    let newStreak = habit.streak;
+    let newLastCompleted = habit.lastCompleted;
+
+    if (!isCompletedToday) {
+      // COMPLETE THE HABIT
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      
+      // If last completion was yesterday, increment streak
+      if (habit.lastCompleted && habit.lastCompleted >= yesterday) {
+        newStreak = habit.streak + 1;
+      } else {
+        // Otherwise, start a new streak
+        newStreak = 1;
+      }
+      newLastCompleted = serverTimestamp(); // Mark as completed now
+      
+    } else {
+      // UNDO THE HABIT (Only allow undo if it was the current streak-keeping day)
+      // This is complex, so for an MVP, we prevent undoing completion from today
+      // to keep the logic simple and prevent streak manipulation exploits.
+      // For simplicity in this MVP, we will treat the button as purely 'Complete'.
+      return; 
+    }
+
+    try {
+      const userId = getUserId(user);
+      const appId = VERCEL_PROJECT_ID; 
+      const habitDocRef = doc(db, 
+        `artifacts/${appId}/users/${userId}/habits`, 
+        habit.id
+      );
+
+      await updateDoc(habitDocRef, {
+        lastCompleted: newLastCompleted,
+        streak: newStreak,
+      });
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("Error updating document: ", e);
+      setError("Failed to update habit status.");
+    }
+  };
+
+  const handleDeleteHabit = async (id) => {
+    try {
+      const userId = getUserId(user);
+      const appId = VERCEL_PROJECT_ID; 
+      const habitDocRef = doc(db, 
+        `artifacts/${appId}/users/${userId}/habits`, 
+        id
+      );
+      await deleteDoc(habitDocRef);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("Error deleting document: ", e);
+      setError("Failed to delete habit.");
+    }
+  };
+
+  const getCompletionStatus = (habit) => {
+    if (!habit.lastCompleted) return false;
+
+    // Check if the habit was completed today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return habit.lastCompleted.getTime() >= today.getTime();
+  };
+
+  const getDayStatus = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    return habits.map(habit => {
+      const isCompleted = getCompletionStatus(habit);
+      return {
+        id: habit.id,
+        isCompleted: isCompleted,
+        streak: habit.streak,
+        name: habit.name,
+      };
+    });
+  }, [habits]);
+
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center min-h-screen bg-gray-50 p-4">
-        <div className="text-xl font-medium text-indigo-600">Loading Habit Forge...</div>
+      <div className="flex items-center justify-center min-h-screen bg-gray-50">
+        <div className="text-xl font-medium text-indigo-600">Loading your habits...</div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 p-4 sm:p-8 font-sans">
-      <div className="max-w-xl mx-auto">
-        <header className="text-center mb-8">
-          <h1 className="text-4xl font-extrabold text-gray-900">{APP_TITLE}</h1>
-          <p className="text-indigo-600 mt-2 text-xl font-semibold">Today is {new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
-          <div className="mt-4 text-sm text-gray-500">
-            Current User ID: <span className="font-mono text-xs bg-gray-200 p-1 rounded">{userId}</span>
-          </div>
-        </header>
-        
-        {/* Error Display */}
-        {error && (
-          <div className="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-lg mb-6" role="alert">
-            <p className="font-bold">Error</p>
-            <p>{error}</p>
-          </div>
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center p-4 sm:p-8 font-inter">
+      <script src="https://cdn.tailwindcss.com"></script>
+      <style>
+        {`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        .font-inter { font-family: 'Inter', sans-serif; }
+        .habit-card {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            transition: all 0.2s;
+        }
+        .habit-card:hover {
+             box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+        .pro-banner {
+            background: linear-gradient(135deg, #4c51bf 0%, #667eea 100%);
+            color: white;
+        }
+        `}
+      </style>
+
+      {/* Header and User ID Display */}
+      <header className="w-full max-w-lg text-center mb-8">
+        <h1 className="text-4xl font-extrabold text-gray-900 tracking-tight">Habit Forge Lite</h1>
+        <p className="text-sm text-gray-500 mt-1">Minimalist Tracker (MVP)</p>
+        <p className="text-xs text-gray-400 mt-2">
+          User ID: <span className="font-mono text-gray-600 break-all">{user?.uid || 'N/A'}</span>
+        </p>
+      </header>
+
+      {/* Error Message Display */}
+      {error && (
+        <div className="w-full max-w-lg p-3 mb-4 text-sm text-red-700 bg-red-100 rounded-lg shadow-md" role="alert">
+          {error}
+        </div>
+      )}
+
+      {/* Habit Creation Form */}
+      <form onSubmit={handleAddHabit} className="w-full max-w-lg mb-8 p-4 bg-white rounded-xl shadow-lg border border-gray-100">
+        <div className="flex space-x-2">
+          <input
+            type="text"
+            value={newHabitName}
+            onChange={(e) => setNewHabitName(e.target.value)}
+            placeholder={isHabitLimitReached ? "Upgrade to add more habits..." : "Enter new habit name (e.g., Read for 30 min)"}
+            className="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 disabled:bg-gray-50"
+            disabled={isHabitLimitReached}
+          />
+          <button
+            type="submit"
+            className={`px-4 py-3 rounded-lg font-semibold text-white transition-colors duration-200 shadow-md ${
+              isHabitLimitReached
+                ? 'bg-gray-400 cursor-not-allowed'
+                : 'bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800'
+            }`}
+          >
+            {isHabitLimitReached ? 'PRO' : 'Add'}
+          </button>
+        </div>
+        {isHabitLimitReached && (
+          <p className="mt-2 text-sm text-red-500 text-center font-medium">
+            Free tier limited to {MAX_FREE_HABITS} habits.
+          </p>
         )}
+      </form>
 
-        {/* Habit List */}
-        <section className="mb-8">
-          <h2 className="text-2xl font-bold text-gray-800 mb-4">Your Habits ({habits.length}/{HABIT_LIMIT})</h2>
-          {habits.length === 0 ? (
-            <div className="p-6 bg-white rounded-xl shadow-inner text-center text-gray-500">
-              <p>No habits tracked yet. Start forging one!</p>
-            </div>
-          ) : (
-            renderHabits()
-          )}
-        </section>
-
-        {/* Add New Habit Form */}
-        <section>
-          <h2 className="text-2xl font-bold text-gray-800 mb-4">New Habit</h2>
-          <div className="bg-white p-6 rounded-xl shadow-lg">
-            {habits.length >= HABIT_LIMIT ? (
-              <div className="text-center p-4">
-                <p className="text-xl font-semibold text-indigo-600 mb-3">Limit Reached!</p>
-                <p className="text-gray-600">You're tracking 3 habits. **Upgrade to Pro** to unlock unlimited slots and full analytics.</p>
-                <button className="mt-4 w-full py-3 px-4 bg-indigo-500 text-white font-bold rounded-lg shadow-lg hover:bg-indigo-700 transition duration-300">
-                  Go Pro! (Simulated Button)
-                </button>
+      {/* Habit List */}
+      <div className="w-full max-w-lg space-y-4">
+        {habits.length === 0 && !isLoading && (
+          <p className="text-center text-gray-500 p-8 bg-white rounded-xl shadow-md">
+            No habits yet. Start tracking your first one!
+          </p>
+        )}
+        
+        {getDayStatus.map(habit => (
+          <div key={habit.id} className="habit-card flex items-center justify-between p-4 bg-white rounded-xl border-l-4 border-indigo-500 shadow-lg">
+            <div className="flex items-center flex-grow min-w-0">
+              <button
+                onClick={() => handleToggleHabit(habits.find(h => h.id === habit.id))}
+                className={`w-10 h-10 flex items-center justify-center rounded-full transition-all duration-300 transform active:scale-95 ${
+                  habit.isCompleted
+                    ? 'bg-green-500 text-white shadow-lg'
+                    : 'bg-gray-200 text-gray-600 hover:bg-gray-300'
+                }`}
+                title={habit.isCompleted ? "Completed Today" : "Mark Complete"}
+              >
+                {habit.isCompleted ? (
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                  </svg>
+                ) : (
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  </svg>
+                )}
+              </button>
+              
+              <div className="ml-4 flex-grow min-w-0">
+                <p className={`font-semibold text-lg truncate ${habit.isCompleted ? 'text-gray-500 line-through' : 'text-gray-800'}`}>
+                  {habit.name}
+                </p>
+                <p className="text-sm text-gray-500 mt-1">
+                  Streak: <span className="font-bold text-indigo-600">{habit.streak}</span> days
+                </p>
               </div>
-            ) : (
-              <form onSubmit={(e) => { e.preventDefault(); addHabit(newHabitName); }} className="flex space-x-3">
-                <input
-                  type="text"
-                  placeholder="e.g., Read 10 Pages"
-                  value={newHabitName}
-                  onChange={(e) => setNewHabitName(e.target.value)}
-                  className="flex-grow p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  maxLength={50}
-                  required
-                />
-                <button
-                  type="submit"
-                  className="bg-indigo-600 text-white font-bold py-3 px-4 rounded-lg shadow-lg hover:bg-indigo-700 transition duration-300 flex-shrink-0"
-                >
-                  Add Habit
-                </button>
-              </form>
-            )}
+            </div>
+
+            {/* Delete Button */}
+            <button
+              onClick={() => handleDeleteHabit(habit.id)}
+              className="ml-4 text-gray-400 hover:text-red-500 p-2 rounded-full transition-colors duration-200"
+              title="Delete Habit"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.86 12.04A2 2 0 0116.14 21H7.86a2 2 0 01-1.99-1.96L5 7m5 4v6m4-6v6M4 7h16" />
+              </svg>
+            </button>
           </div>
-        </section>
+        ))}
       </div>
+      
+      {/* Monetization Banner (The Main Goal!) */}
+      <div className="w-full max-w-lg mt-8 p-6 pro-banner rounded-xl shadow-2xl text-center">
+        <h3 className="text-2xl font-bold mb-2">Ready to Go Pro?</h3>
+        <p className="text-sm opacity-90 mb-4">
+          Unlock **Unlimited Habits**, full history analytics, and custom themes to supercharge your tracking.
+        </p>
+        <button
+          onClick={() => setShowUpgradeModal(true)}
+          className="w-full py-3 bg-yellow-400 text-indigo-900 font-bold rounded-lg shadow-lg hover:bg-yellow-300 transition-colors transform active:scale-95"
+        >
+          UPGRADE TO PRO (Click to see what happens!)
+        </button>
+      </div>
+
+
+      {/* Custom Modal for Upgrade (instead of alert()) */}
+      {showUpgradeModal && (
+        <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50 transition-opacity duration-300">
+          <div className="bg-white rounded-xl p-6 sm:p-8 w-full max-w-sm shadow-2xl transform transition-transform duration-300">
+            <h4 className="text-2xl font-bold text-indigo-600 mb-4">Pro Feature Locked 🔒</h4>
+            <p className="text-gray-700 mb-6">
+              You've hit the **3-habit limit** on the free tier. To track unlimited habits and view your streak history, you'll need to subscribe.
+            </p>
+            <div className="space-y-3">
+              <button
+                onClick={() => setShowUpgradeModal(false)}
+                className="w-full py-3 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700"
+              >
+                Start Free Trial
+              </button>
+              <button
+                onClick={() => setShowUpgradeModal(false)}
+                className="w-full py-3 text-gray-500 font-semibold rounded-lg border border-gray-300 hover:bg-gray-100"
+              >
+                Close and Go Back
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
 
-// Render the App component into the root element
-export default App;
-
+export default HabitTracker;
