@@ -1,12 +1,15 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { createRoot } from 'https://esm.sh/react-dom@18.2.0/client'; // Import createRoot
-import { initializeApp } from 'https://esm.sh/firebase@10.12.2/app';
+import { createRoot } from 'react-dom/client'; // Standard npm import for React 18
+import { initializeApp } from 'firebase/app'; // Standard npm import
 import { 
   getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
-} from 'https://esm.sh/firebase@10.12.2/auth';
+} from 'firebase/auth'; // Standard npm import
 import { 
   getFirestore, doc, collection, query, onSnapshot, setDoc, deleteDoc 
-} from 'https://esm.sh/firebase@10.12.2/firestore';
+} from 'firebase/firestore'; // Standard npm import
+
+// NOTE: For this to work on Vercel, you must ensure 'react', 'react-dom', 
+// and 'firebase' are listed as dependencies in your project's package.json file.
 
 // --- Global Variables (Canvas Runtime Provided) ---
 // We use these checks to ensure the app runs both in the environment
@@ -21,13 +24,27 @@ const APP_TITLE = "Habit Forge Lite";
 
 // Utility function to get today's date key (YYYY-MM-DD)
 const getTodayKey = () => {
-  return new Date().toISOString().split('T')[0];
+  // Use UTC components to prevent local timezone issues with habit tracking
+  const date = new Date();
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 };
 
 // Custom Modal/Alert Replacement
-// This function replaces forbidden alert() and window.confirm()
 const CustomModal = ({ title, message, onConfirm, onCancel, isVisible }) => {
     if (!isVisible) return null;
+
+    // We use a local state for the modal visibility instead of managing it externally
+    const handleClose = () => {
+        if (onCancel) onCancel();
+    };
+
+    const handleConfirm = () => {
+        if (onConfirm) onConfirm();
+    };
+
 
     return (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
@@ -37,7 +54,7 @@ const CustomModal = ({ title, message, onConfirm, onCancel, isVisible }) => {
                 <div className="flex justify-end space-x-3">
                     {onCancel && (
                         <button
-                            onClick={onCancel}
+                            onClick={handleClose}
                             className="px-4 py-2 text-sm font-semibold text-gray-600 bg-gray-200 rounded-lg hover:bg-gray-300 transition"
                         >
                             Cancel
@@ -45,7 +62,7 @@ const CustomModal = ({ title, message, onConfirm, onCancel, isVisible }) => {
                     )}
                     {onConfirm && (
                         <button
-                            onClick={onConfirm}
+                            onClick={handleConfirm}
                             className="px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 transition"
                         >
                             Confirm
@@ -59,7 +76,7 @@ const CustomModal = ({ title, message, onConfirm, onCancel, isVisible }) => {
 
 
 // Main Application Component
-const App = () => { // Renamed from HabitTracker to App
+const App = () => {
   const [db, setDb] = useState(null);
   const [auth, setAuth] = useState(null);
   const [userId, setUserId] = useState(null);
@@ -72,14 +89,15 @@ const App = () => { // Renamed from HabitTracker to App
   const [isModalVisible, setIsModalVisible] = useState(false);
   const [modalTitle, setModalTitle] = useState('');
   const [modalMessage, setModalMessage] = useState('');
-  const [modalAction, setModalAction] = useState(null); // Function to execute on confirm
-  const [isDeleteModal, setIsDeleteModal] = useState(false);
+  const [modalAction, setModalAction] = useState(null); 
   
   // 1. Firebase Initialization and Authentication
   useEffect(() => {
     try {
-      if (Object.keys(firebaseConfig).length === 0) {
-        throw new Error("Firebase config is missing.");
+      if (Object.keys(firebaseConfig).length === 0 || !firebaseConfig.apiKey) {
+        // If the config is empty, we allow the app to run but flag the error later
+        console.warn("Firebase configuration is missing or incomplete.");
+        // This warning is fine, we still need to attempt auth for a userId
       }
       
       const app = initializeApp(firebaseConfig);
@@ -93,10 +111,15 @@ const App = () => { // Renamed from HabitTracker to App
       const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
         if (!user) {
           // Sign in using provided token or anonymously if token is missing
-          if (initialAuthToken) {
-            await signInWithCustomToken(authInstance, initialAuthToken);
-          } else {
-            await signInAnonymously(authInstance);
+          try {
+            if (initialAuthToken) {
+              await signInWithCustomToken(authInstance, initialAuthToken);
+            } else {
+              await signInAnonymously(authInstance);
+            }
+          } catch(e) {
+            console.error("Auth Sign-In Error:", e);
+            setError("Failed to sign in. Data persistence may not work.");
           }
         }
         // Once signed in (or already signed in), set the userId
@@ -117,7 +140,9 @@ const App = () => { // Renamed from HabitTracker to App
   useEffect(() => {
     if (db && userId) {
       const habitsPath = `/artifacts/${appId}/users/${userId}/habits`;
-      const habitsQuery = query(collection(db, habitsPath));
+      // Use firestore collection reference
+      const habitsCollectionRef = collection(db, habitsPath);
+      const habitsQuery = query(habitsCollectionRef);
       
       const unsubscribe = onSnapshot(habitsQuery, (snapshot) => {
         const habitsData = snapshot.docs.map(doc => ({
@@ -142,9 +167,8 @@ const App = () => { // Renamed from HabitTracker to App
   const showLimitModal = () => {
     setModalTitle("Upgrade Required");
     setModalMessage(`You are currently tracking ${HABIT_LIMIT} habits. Upgrade to Pro to unlock unlimited slots and full analytics.`);
-    setIsDeleteModal(false);
     setModalAction(() => () => { // Simulated upgrade action
-        alert("Simulating Pro Upgrade complete!");
+        console.log("Simulating Pro Upgrade complete!");
         setIsModalVisible(false);
     });
     setIsModalVisible(true);
@@ -154,6 +178,7 @@ const App = () => { // Renamed from HabitTracker to App
     if (!name.trim()) return;
     if (habits.length >= HABIT_LIMIT) {
       showLimitModal();
+      setNewHabitName('');
       return;
     }
     if (!db || !userId) {
@@ -161,12 +186,13 @@ const App = () => { // Renamed from HabitTracker to App
       return;
     }
 
-    const newHabitRef = doc(collection(db, `/artifacts/${appId}/users/${userId}/habits`));
+    const habitsCollectionRef = collection(db, `/artifacts/${appId}/users/${userId}/habits`);
+    const newHabitRef = doc(habitsCollectionRef); // Let Firestore generate the ID
     
     try {
       await setDoc(newHabitRef, {
         name: name.trim(),
-        createdAt: new Date(),
+        createdAt: new Date().toISOString(),
         // Initialize today's status as false
         [todayKey]: false, 
       });
@@ -175,7 +201,7 @@ const App = () => { // Renamed from HabitTracker to App
       console.error("Error adding habit:", e);
       setError("Could not save habit. Try again.");
     }
-  }, [db, userId, habits, todayKey]);
+  }, [db, userId, habits.length, todayKey]);
 
   const toggleHabit = useCallback(async (habit) => {
     if (!db || !userId) return;
@@ -191,9 +217,12 @@ const App = () => { // Renamed from HabitTracker to App
       setError("Could not update habit status.");
     }
   }, [db, userId, todayKey]);
-
-  const handleDeleteHabitConfirmed = async (habitId) => {
-    if (!db || !userId) return;
+  
+  const handleDeleteHabitConfirmed = useCallback(async (habitId) => {
+    if (!db || !userId) {
+      setError("System not ready for deletion.");
+      return;
+    }
     
     setIsModalVisible(false); // Close modal immediately
     
@@ -205,12 +234,11 @@ const App = () => { // Renamed from HabitTracker to App
       console.error("Error deleting habit:", e);
       setError("Could not delete habit.");
     }
-  };
+  }, [db, userId]);
 
   const showDeleteConfirmation = useCallback((habitId) => {
     setModalTitle("Confirm Deletion");
     setModalMessage("Are you sure you want to delete this habit? This action cannot be undone.");
-    setIsDeleteModal(true);
     setModalAction(() => () => handleDeleteHabitConfirmed(habitId)); // Set the action to delete
     setIsModalVisible(true);
   }, [handleDeleteHabitConfirmed]);
@@ -218,6 +246,7 @@ const App = () => { // Renamed from HabitTracker to App
   // --- Rendering Functions ---
 
   const renderHabits = () => {
+    // Sort habits by creation date or name if needed, but in-memory sort is fine.
     return habits.map((habit) => {
       const isCompleted = habit[todayKey] || false;
       
@@ -361,5 +390,5 @@ if (container) {
     const root = createRoot(container);
     root.render(<App />);
 } else {
-    console.error("Root element not found.");
+    console.error("Root element not found (ID 'root' required).");
 }
