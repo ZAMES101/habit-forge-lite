@@ -1,427 +1,365 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { initializeApp } from 'firebase/app'; // <-- Correct Import for initializeApp
+import { createRoot } from 'https://esm.sh/react-dom@18.2.0/client'; // Import createRoot
+import { initializeApp } from 'https://esm.sh/firebase@10.12.2/app';
 import { 
-    getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken 
-} from 'firebase/auth';
+  getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
+} from 'https://esm.sh/firebase@10.12.2/auth';
 import { 
-    getFirestore, doc, collection, query, onSnapshot, updateDoc, addDoc, 
-    deleteDoc, serverTimestamp 
-} from 'firebase/firestore'; // <-- Removed initializeApp from here
+  getFirestore, doc, collection, query, onSnapshot, setDoc, deleteDoc 
+} from 'https://esm.sh/firebase@10.12.2/firestore';
 
-// --- Global Variable Access Handlers (MANDATORY in this environment) ---
-const getAppId = () => typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const getInitialAuthToken = () => typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : '';
-const getFirebaseConfig = () => {
-    try {
-        // MUST use the global configuration object
-        return typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-    } catch (e) {
-        console.error("Failed to parse Firebase Config:", e);
-        return {};
-    }
+// --- Global Variables (Canvas Runtime Provided) ---
+// We use these checks to ensure the app runs both in the environment
+// and potentially locally if the user hardcodes values.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : '';
+
+// Constants
+const HABIT_LIMIT = 3; // Enforce the free tier limit from the strategy
+const APP_TITLE = "Habit Forge Lite";
+
+// Utility function to get today's date key (YYYY-MM-DD)
+const getTodayKey = () => {
+  return new Date().toISOString().split('T')[0];
 };
 
-// Utility function to get today's date in UTC YYYY-MM-DD format for reliable streak tracking
-const getTodayDateString = () => {
-    const today = new Date();
-    // Use UTC date string for consistent daily rollover globally
-    return today.toISOString().split('T')[0];
-};
-
-// --- Firebase Initialization Hook (Ensures single, correct setup) ---
-function useFirebaseServices() {
-    const [services, setServices] = useState(null);
-
-    useEffect(() => {
-        const firebaseConfig = getFirebaseConfig();
-        
-        if (Object.keys(firebaseConfig).length === 0) {
-            console.error("Firebase config is empty. Cannot initialize.");
-            return;
-        }
-
-        // Initialize App
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        
-        setServices({ app, auth, db });
-    }, []);
-
-    return services;
-}
-
-// --- Authentication Hook ---
-function useAuthStatus(auth) { 
-  const [user, setUser] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const initialAuthToken = getInitialAuthToken();
-
-  useEffect(() => {
-    if (!auth) return;
-
-    const attemptSignIn = async () => {
-        try {
-            if (initialAuthToken && initialAuthToken !== "") {
-                await signInWithCustomToken(auth, initialAuthToken);
-            } else {
-                await signInAnonymously(auth);
-            }
-        } catch (error) {
-            console.error("Authentication Error:", error);
-        }
-    };
-    attemptSignIn();
-    
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setLoading(false);
-    });
-
-    return () => unsubscribe();
-  }, [auth, initialAuthToken]);
-
-  return { user, loading };
-}
-
-
-// --- Component Definition ---
-
-const HABITS_COLLECTION_NAME = 'habits';
-const MAX_FREE_HABITS = 3; 
-
-const HabitTracker = () => {
-    // 1. Get Firebase Services
-    const firebaseServices = useFirebaseServices();
-    const auth = firebaseServices?.auth;
-    const db = firebaseServices?.db;
-
-    // 2. Get Auth Status
-    const { user, loading: authLoading } = useAuthStatus(auth);
-    const userId = user?.uid;
-
-    const [habits, setHabits] = useState([]);
-    const [newHabitName, setNewHabitName] = useState('');
-    const [isLoadingData, setIsLoadingData] = useState(true);
-    const [error, setError] = useState(null);
-    const [showUpgradeModal, setShowUpgradeModal] = useState(false);
-    
-    const isHabitLimitReached = habits.length >= MAX_FREE_HABITS;
-
-    // --- Data Fetching (Real-time Listener) ---
-    useEffect(() => {
-        if (authLoading || !user || !db) return; 
-
-        setIsLoadingData(true);
-        const appId = getAppId();
-        
-        // Firestore Path: /artifacts/{appId}/users/{userId}/habits
-        const collectionPath = `/artifacts/${appId}/users/${user.uid}/${HABITS_COLLECTION_NAME}`;
-        const habitsRef = collection(db, collectionPath);
-        const q = query(habitsRef); 
-
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            const habitsList = snapshot.docs.map(doc => {
-                const data = doc.data();
-                return {
-                    id: doc.id,
-                    name: data.name,
-                    // lastCheckIn is a YYYY-MM-DD string
-                    lastCheckIn: data.lastCheckIn || '', 
-                    streak: data.streak || 0,
-                    // Use Firestore Timestamp for sorting, convert to Date if needed later
-                    createdAt: data.createdAt?.toDate() || new Date(), 
-                };
-            }).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
-      
-            setHabits(habitsList);
-            setIsLoadingData(false);
-        }, (err) => {
-            console.error("Firestore Snapshot Error:", err);
-            setError("Failed to load habits. Check console for details.");
-            setIsLoadingData(false);
-        });
-
-        return () => unsubscribe();
-    }, [user, authLoading, db]);
-
-    // --- Core Habit Logic ---
-
-    const handleAddHabit = async (e) => {
-        e.preventDefault();
-        if (newHabitName.trim() === '') return;
-
-        if (isHabitLimitReached) {
-            setShowUpgradeModal(true);
-            return;
-        }
-
-        const newHabit = {
-            name: newHabitName.trim(),
-            createdAt: serverTimestamp(),
-            lastCheckIn: '', // YYYY-MM-DD string
-            streak: 0,
-            userId: userId,
-        };
-
-        try {
-            const appId = getAppId();
-            const habitsCollectionRef = collection(db, 
-                `artifacts/${appId}/users/${userId}/${HABITS_COLLECTION_NAME}`
-            );
-            
-            // Use addDoc for auto-generated IDs
-            await addDoc(habitsCollectionRef, newHabit); 
-            setNewHabitName('');
-        } catch (e) {
-            console.error("Error adding document: ", e);
-            setError("Failed to add habit.");
-        }
-    };
-
-    const handleToggleHabit = async (habit) => {
-        const todayString = getTodayDateString();
-        const isCompletedToday = habit.lastCheckIn === todayString;
-
-        if (isCompletedToday) return; // Prevent double check-in/undo for simplicity
-
-        let newStreak = habit.streak;
-
-        try {
-            const lastCheckIn = habit.lastCheckIn;
-            
-            // Calculate yesterday's date string for streak check
-            const yesterdayDate = new Date();
-            yesterdayDate.setDate(yesterdayDate.getDate() - 1);
-            const yesterdayString = yesterdayDate.toISOString().split('T')[0];
-
-            if (lastCheckIn === yesterdayString) {
-                // Continued streak
-                newStreak += 1;
-            } else {
-                // Streak broken or first check-in
-                newStreak = 1;
-            }
-
-            const appId = getAppId();
-            const habitDocRef = doc(db, 
-                `artifacts/${appId}/users/${userId}/${HABITS_COLLECTION_NAME}`, 
-                habit.id
-            );
-
-            await updateDoc(habitDocRef, {
-                lastCheckIn: todayString,
-                streak: newStreak,
-            });
-            
-        } catch (e) {
-            console.error("Error updating document: ", e);
-            setError("Failed to update habit status.");
-        }
-    };
-
-    const handleDeleteHabit = async (id) => {
-        try {
-            const appId = getAppId();
-            const habitDocRef = doc(db, 
-                `artifacts/${appId}/users/${userId}/${HABITS_COLLECTION_NAME}`, 
-                id
-            );
-            await deleteDoc(habitDocRef);
-        } catch (e) {
-            console.error("Error deleting document: ", e);
-            setError("Failed to delete habit.");
-        }
-    };
-
-    const getCompletionStatus = useCallback((lastCheckIn) => {
-        return lastCheckIn === getTodayDateString();
-    }, []);
-
-    const dayStatus = useMemo(() => {
-        return habits.map(habit => ({
-            id: habit.id,
-            isCompleted: getCompletionStatus(habit.lastCheckIn),
-            streak: habit.streak,
-            name: habit.name,
-        }));
-    }, [habits, getCompletionStatus]);
-
-    if (isLoadingData || authLoading || !firebaseServices) {
-        return (
-            <div className="flex items-center justify-center min-h-screen bg-gray-50">
-                <div className="text-xl font-medium text-indigo-600 animate-pulse">
-                    Loading your Habit Forge...
-                </div>
-            </div>
-        );
-    }
+// Custom Modal/Alert Replacement
+// This function replaces forbidden alert() and window.confirm()
+const CustomModal = ({ title, message, onConfirm, onCancel, isVisible }) => {
+    if (!isVisible) return null;
 
     return (
-        <div className="min-h-screen bg-gray-50 flex flex-col items-center p-4 sm:p-8 font-inter">
-            {/* Tailwind is assumed available, no script tag needed in React */}
-            <style>
-                {/* Removed Tailwind CDN script and kept only custom styles */}
-                {`
-                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-                .font-inter { font-family: 'Inter', sans-serif; }
-                .habit-card {
-                    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-                    transition: all 0.2s;
-                }
-                .habit-card:hover {
-                    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
-                }
-                .pro-banner {
-                    background: linear-gradient(135deg, #4c51bf 0%, #667eea 100%);
-                    color: white;
-                }
-                `}
-            </style>
-
-            {/* Header and User ID Display */}
-            <header className="w-full max-w-lg text-center mb-8">
-                <h1 className="text-4xl font-extrabold text-gray-900 tracking-tight">Habit Forge Lite</h1>
-                <p className="text-sm text-gray-500 mt-1">Minimalist Tracker (MVP)</p>
-                <p className="text-xs text-gray-400 mt-2">
-                    User ID: <span className="font-mono text-gray-600 break-all">{userId || 'N/A'}</span>
-                </p>
-            </header>
-
-            {/* Error Message Display */}
-            {error && (
-                <div className="w-full max-w-lg p-3 mb-4 text-sm text-red-700 bg-red-100 rounded-lg shadow-md" role="alert">
-                    {error}
-                </div>
-            )}
-
-            {/* Habit Creation Form */}
-            <form onSubmit={handleAddHabit} className="w-full max-w-lg mb-8 p-4 bg-white rounded-xl shadow-lg border border-gray-100">
-                <div className="flex space-x-2">
-                    <input
-                        type="text"
-                        value={newHabitName}
-                        onChange={(e) => setNewHabitName(e.target.value)}
-                        placeholder={isHabitLimitReached ? "Upgrade to add more habits..." : "Enter new habit name (e.g., Read for 30 min)"}
-                        className="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 disabled:bg-gray-50"
-                        disabled={isHabitLimitReached}
-                    />
-                    <button
-                        type="submit"
-                        className={`px-4 py-3 rounded-lg font-semibold text-white transition-colors duration-200 shadow-md ${
-                            isHabitLimitReached
-                                ? 'bg-gray-400 cursor-not-allowed'
-                                : 'bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800'
-                        }`}
-                    >
-                        {isHabitLimitReached ? 'PRO' : 'Add'}
-                    </button>
-                </div>
-                {isHabitLimitReached && (
-                    <p className="mt-2 text-sm text-red-500 text-center font-medium">
-                        Free tier limited to {MAX_FREE_HABITS} habits.
-                    </p>
-                )}
-            </form>
-
-            {/* Habit List */}
-            <div className="w-full max-w-lg space-y-4">
-                {habits.length === 0 && !isLoadingData && (
-                    <p className="text-center text-gray-500 p-8 bg-white rounded-xl shadow-md">
-                        No habits yet. Start tracking your first one!
-                    </p>
-                )}
-                
-                {dayStatus.map(habit => (
-                    <div key={habit.id} className="habit-card flex items-center justify-between p-4 bg-white rounded-xl border-l-4 border-indigo-500 shadow-lg">
-                        <div className="flex items-center flex-grow min-w-0">
-                            <button
-                                onClick={() => handleToggleHabit(habits.find(h => h.id === habit.id))}
-                                className={`w-10 h-10 flex items-center justify-center rounded-full transition-all duration-300 transform active:scale-95 ${
-                                    habit.isCompleted
-                                        ? 'bg-green-500 text-white shadow-lg cursor-not-allowed' // Make completed button look and act disabled
-                                        : 'bg-gray-200 text-gray-600 hover:bg-gray-300'
-                                }`}
-                                title={habit.isCompleted ? "Completed Today (Cannot Undo)" : "Mark Complete"}
-                                disabled={habit.isCompleted}
-                            >
-                                {habit.isCompleted ? (
-                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                                    </svg>
-                                ) : (
-                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                                    </svg>
-                                )}
-                            </button>
-                            
-                            <div className="ml-4 flex-grow min-w-0">
-                                <p className={`font-semibold text-lg truncate ${habit.isCompleted ? 'text-gray-500 line-through' : 'text-gray-800'}`}>
-                                    {habit.name}
-                                </p>
-                                <p className="text-sm text-gray-500 mt-1">
-                                    Streak: <span className="font-bold text-indigo-600">{habit.streak}</span> days 🔥
-                                </p>
-                            </div>
-                        </div>
-
-                        {/* Delete Button */}
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm p-6 transform transition-all duration-300">
+                <h3 className="text-xl font-bold text-gray-900 mb-3">{title}</h3>
+                <p className="text-gray-700 mb-6">{message}</p>
+                <div className="flex justify-end space-x-3">
+                    {onCancel && (
                         <button
-                            onClick={() => handleDeleteHabit(habit.id)}
-                            className="ml-4 text-gray-400 hover:text-red-500 p-2 rounded-full transition-colors duration-200"
-                            title="Delete Habit"
+                            onClick={onCancel}
+                            className="px-4 py-2 text-sm font-semibold text-gray-600 bg-gray-200 rounded-lg hover:bg-gray-300 transition"
                         >
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.86 12.04A2 2 0 0116.14 21H7.86a2 2 0 01-1.99-1.96L5 7m5 4v6m4-6v6M4 7h16" />
-                            </svg>
+                            Cancel
                         </button>
-                    </div>
-                ))}
-            </div>
-            
-            {/* Monetization Banner (The Main Goal!) */}
-            <div className="w-full max-w-lg mt-8 p-6 pro-banner rounded-xl shadow-2xl text-center">
-                <h3 className="text-2xl font-bold mb-2">Ready to Go Pro?</h3>
-                <p className="text-sm opacity-90 mb-4">
-                    Unlock **Unlimited Habits**, full history analytics, and custom themes to supercharge your tracking.
-                </p>
-                <button
-                    onClick={() => setShowUpgradeModal(true)}
-                    className="w-full py-3 bg-yellow-400 text-indigo-900 font-bold rounded-lg shadow-lg hover:bg-yellow-300 transition-colors transform active:scale-95"
-                >
-                    UPGRADE TO PRO (Click to see what happens!)
-                </button>
-            </div>
-
-
-            {/* Custom Modal for Upgrade (instead of alert()) */}
-            {showUpgradeModal && (
-                <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50 transition-opacity duration-300">
-                    <div className="bg-white rounded-xl p-6 sm:p-8 w-full max-w-sm shadow-2xl transform transition-transform duration-300">
-                        <h4 className="text-2xl font-bold text-indigo-600 mb-4">Pro Feature Locked 🔒</h4>
-                        <p className="text-gray-700 mb-6">
-                            You've hit the **{MAX_FREE_HABITS}-habit limit** on the free tier. To track unlimited habits and view your streak history, you'll need to subscribe.
-                        </p>
-                        <div className="space-y-3">
-                            <button
-                                onClick={() => setShowUpgradeModal(false)}
-                                className="w-full py-3 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700"
-                            >
-                                Start Free Trial
-                            </button>
-                            <button
-                                onClick={() => setShowUpgradeModal(false)}
-                                className="w-full py-3 text-gray-500 font-semibold rounded-lg border border-gray-300 hover:bg-gray-100"
-                            >
-                                Close and Go Back
-                            </button>
-                        </div>
-                    </div>
+                    )}
+                    {onConfirm && (
+                        <button
+                            onClick={onConfirm}
+                            className="px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 transition"
+                        >
+                            Confirm
+                        </button>
+                    )}
                 </div>
-            )}
+            </div>
         </div>
     );
 };
 
-export default HabitTracker;
+
+// Main Application Component
+const App = () => { // Renamed from HabitTracker to App
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [habits, setHabits] = useState([]);
+  const [newHabitName, setNewHabitName] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  // Modal State
+  const [isModalVisible, setIsModalVisible] = useState(false);
+  const [modalTitle, setModalTitle] = useState('');
+  const [modalMessage, setModalMessage] = useState('');
+  const [modalAction, setModalAction] = useState(null); // Function to execute on confirm
+  const [isDeleteModal, setIsDeleteModal] = useState(false);
+  
+  // 1. Firebase Initialization and Authentication
+  useEffect(() => {
+    try {
+      if (Object.keys(firebaseConfig).length === 0) {
+        throw new Error("Firebase config is missing.");
+      }
+      
+      const app = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(app);
+      const authInstance = getAuth(app);
+      
+      setDb(firestoreDb);
+      setAuth(authInstance);
+
+      // Set up authentication state listener
+      const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
+        if (!user) {
+          // Sign in using provided token or anonymously if token is missing
+          if (initialAuthToken) {
+            await signInWithCustomToken(authInstance, initialAuthToken);
+          } else {
+            await signInAnonymously(authInstance);
+          }
+        }
+        // Once signed in (or already signed in), set the userId
+        setUserId(authInstance.currentUser?.uid || crypto.randomUUID());
+        setIsLoading(false);
+        console.log("Firebase Auth Ready. User ID:", authInstance.currentUser?.uid || 'Anonymous');
+      });
+
+      return () => unsubscribe(); // Cleanup auth listener
+    } catch (e) {
+      console.error("Firebase Initialization Error:", e);
+      setError("Failed to connect to backend. Check console for details.");
+      setIsLoading(false);
+    }
+  }, []);
+
+  // 2. Firestore Real-Time Data Listener (onSnapshot)
+  useEffect(() => {
+    if (db && userId) {
+      const habitsPath = `/artifacts/${appId}/users/${userId}/habits`;
+      const habitsQuery = query(collection(db, habitsPath));
+      
+      const unsubscribe = onSnapshot(habitsQuery, (snapshot) => {
+        const habitsData = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+        setHabits(habitsData);
+        console.log(`Habits loaded: ${habitsData.length}`);
+      }, (e) => {
+        console.error("Firestore Snapshot Error:", e);
+        setError("Error fetching habit data.");
+      });
+
+      return () => unsubscribe(); // Cleanup snapshot listener
+    }
+  }, [db, userId]);
+
+  // --- Habit Management Logic ---
+
+  const todayKey = useMemo(getTodayKey, []);
+  
+  const showLimitModal = () => {
+    setModalTitle("Upgrade Required");
+    setModalMessage(`You are currently tracking ${HABIT_LIMIT} habits. Upgrade to Pro to unlock unlimited slots and full analytics.`);
+    setIsDeleteModal(false);
+    setModalAction(() => () => { // Simulated upgrade action
+        alert("Simulating Pro Upgrade complete!");
+        setIsModalVisible(false);
+    });
+    setIsModalVisible(true);
+  };
+  
+  const addHabit = useCallback(async (name) => {
+    if (!name.trim()) return;
+    if (habits.length >= HABIT_LIMIT) {
+      showLimitModal();
+      return;
+    }
+    if (!db || !userId) {
+      setError("System not ready. Please wait or refresh.");
+      return;
+    }
+
+    const newHabitRef = doc(collection(db, `/artifacts/${appId}/users/${userId}/habits`));
+    
+    try {
+      await setDoc(newHabitRef, {
+        name: name.trim(),
+        createdAt: new Date(),
+        // Initialize today's status as false
+        [todayKey]: false, 
+      });
+      setNewHabitName('');
+    } catch (e) {
+      console.error("Error adding habit:", e);
+      setError("Could not save habit. Try again.");
+    }
+  }, [db, userId, habits, todayKey]);
+
+  const toggleHabit = useCallback(async (habit) => {
+    if (!db || !userId) return;
+    
+    const habitRef = doc(db, `/artifacts/${appId}/users/${userId}/habits`, habit.id);
+    const isCompleted = habit[todayKey] || false;
+    
+    try {
+      // Update only the current day's completion status
+      await setDoc(habitRef, { [todayKey]: !isCompleted }, { merge: true });
+    } catch (e) {
+      console.error("Error toggling habit:", e);
+      setError("Could not update habit status.");
+    }
+  }, [db, userId, todayKey]);
+
+  const handleDeleteHabitConfirmed = async (habitId) => {
+    if (!db || !userId) return;
+    
+    setIsModalVisible(false); // Close modal immediately
+    
+    const habitRef = doc(db, `/artifacts/${appId}/users/${userId}/habits`, habitId);
+    
+    try {
+      await deleteDoc(habitRef);
+    } catch (e) {
+      console.error("Error deleting habit:", e);
+      setError("Could not delete habit.");
+    }
+  };
+
+  const showDeleteConfirmation = useCallback((habitId) => {
+    setModalTitle("Confirm Deletion");
+    setModalMessage("Are you sure you want to delete this habit? This action cannot be undone.");
+    setIsDeleteModal(true);
+    setModalAction(() => () => handleDeleteHabitConfirmed(habitId)); // Set the action to delete
+    setIsModalVisible(true);
+  }, [handleDeleteHabitConfirmed]);
+
+  // --- Rendering Functions ---
+
+  const renderHabits = () => {
+    return habits.map((habit) => {
+      const isCompleted = habit[todayKey] || false;
+      
+      return (
+        <div 
+          key={habit.id} 
+          className="flex items-center justify-between p-4 bg-white rounded-xl shadow-md mb-3 transition-all duration-300 hover:shadow-lg hover:bg-indigo-50"
+        >
+          <div className="flex items-center space-x-4">
+            <button 
+              onClick={() => toggleHabit(habit)}
+              className={`w-8 h-8 rounded-full border-2 transition-colors duration-300 flex items-center justify-center 
+                ${isCompleted ? 'bg-indigo-600 border-indigo-600' : 'bg-gray-200 border-gray-300 hover:bg-indigo-200'}
+              `}
+              aria-label={isCompleted ? "Mark incomplete" : "Mark complete"}
+            >
+              <svg className={`w-4 h-4 text-white transition-opacity duration-300 ${isCompleted ? 'opacity-100' : 'opacity-0'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>
+            </button>
+            <span className={`text-lg font-medium ${isCompleted ? 'text-gray-500 line-through' : 'text-gray-800'}`}>
+              {habit.name}
+            </span>
+          </div>
+          
+          <button 
+            onClick={() => showDeleteConfirmation(habit.id)}
+            className="text-gray-400 hover:text-red-500 transition-colors duration-200 p-1"
+            aria-label="Delete habit"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+          </button>
+        </div>
+      );
+    });
+  };
+
+  // --- Main Render ---
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50 p-4">
+        <div className="text-xl font-medium text-indigo-600">Loading Habit Forge...</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-4 sm:p-8 font-sans">
+      
+      {/* Custom Modal for Confirmation / Limit Reached */}
+      <CustomModal
+        isVisible={isModalVisible}
+        title={modalTitle}
+        message={modalMessage}
+        onConfirm={modalAction}
+        onCancel={() => setIsModalVisible(false)}
+      />
+
+      <div className="max-w-xl mx-auto">
+        <header className="text-center mb-8">
+          <h1 className="text-4xl font-extrabold text-gray-900">{APP_TITLE}</h1>
+          <p className="text-indigo-600 mt-2 text-xl font-semibold">Today is {new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
+          <div className="mt-4 text-sm text-gray-500">
+            Current User ID: <span className="font-mono text-xs bg-gray-200 p-1 rounded break-all">{userId}</span>
+          </div>
+        </header>
+        
+        {/* Error Display */}
+        {error && (
+          <div className="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-lg mb-6" role="alert">
+            <p className="font-bold">Error</p>
+            <p>{error}</p>
+          </div>
+        )}
+
+        {/* Habit List */}
+        <section className="mb-8">
+          <h2 className="text-2xl font-bold text-gray-800 mb-4">Your Habits ({habits.length}/{HABIT_LIMIT})</h2>
+          {habits.length === 0 ? (
+            <div className="p-6 bg-white rounded-xl shadow-inner text-center text-gray-500">
+              <p>No habits tracked yet. Start forging one!</p>
+            </div>
+          ) : (
+            renderHabits()
+          )}
+        </section>
+
+        {/* Add New Habit Form */}
+        <section>
+          <h2 className="text-2xl font-bold text-gray-800 mb-4">New Habit</h2>
+          <div className="bg-white p-6 rounded-xl shadow-lg">
+            {habits.length >= HABIT_LIMIT ? (
+              <div className="text-center p-4">
+                <p className="text-xl font-semibold text-indigo-600 mb-3">Limit Reached!</p>
+                <p className="text-gray-600">You're tracking 3 habits. **Upgrade to Pro** to unlock unlimited slots and full analytics.</p>
+                <button 
+                    onClick={showLimitModal}
+                    className="mt-4 w-full py-3 px-4 bg-indigo-500 text-white font-bold rounded-lg shadow-lg hover:bg-indigo-700 transition duration-300"
+                >
+                  Go Pro! (Simulated Button)
+                </button>
+              </div>
+            ) : (
+              <form onSubmit={(e) => { e.preventDefault(); addHabit(newHabitName); }} className="flex space-x-3">
+                <input
+                  type="text"
+                  placeholder="e.g., Read 10 Pages"
+                  value={newHabitName}
+                  onChange={(e) => setNewHabitName(e.target.value)}
+                  className="flex-grow p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  maxLength={50}
+                  required
+                />
+                <button
+                  type="submit"
+                  className="bg-indigo-600 text-white font-bold py-3 px-4 rounded-lg shadow-lg hover:bg-indigo-700 transition duration-300 flex-shrink-0"
+                >
+                  Add Habit
+                </button>
+              </form>
+            )}
+          </div>
+        </section>
+      </div>
+      
+      {/* Global styles for smooth rendering */}
+      <style jsx global>{`
+        body {
+          font-family: 'Inter', sans-serif;
+          margin: 0;
+          padding: 0;
+          overflow-x: hidden;
+        }
+      `}</style>
+    </div>
+  );
+};
+
+// --- MANDATORY REACT RENDER BLOCK ---
+const container = document.getElementById('root');
+if (container) {
+    const root = createRoot(container);
+    root.render(<App />);
+} else {
+    console.error("Root element not found.");
+}
